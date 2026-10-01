@@ -1,22 +1,24 @@
 # 量纲检查笔记本（Dimension Notebook）
 
 面向工程教师的**本地**公式笔记工具：输入公式 → 给变量赋数值与单位 → 自动计算并检查常见量纲错误。
-无需服务器，数据只保存在浏览器 IndexedDB 中。
+无需服务器，数据只保存在浏览器 IndexedDB 中。一条公式**已验证**的结果（数值 + 单位 + 来源版本）
+还可以发布为“引用”，供另一条公式当作派生变量使用，系统自动沿依赖图重新计算并全程可追溯。
 
 - **React 18 + TypeScript** 组织界面与文档
 - **MathLive** 提供所见即所得的数学输入（`+ − × ÷`、幂、分数、括号、希腊字母/下标）
-- **KaTeX** 渲染原式与代入后的计算式（问题节点红/橙色高亮）
+- **KaTeX** 渲染原式与代入后的计算式（问题节点红/橙色高亮，引用节点绿色下划线 + “引”标记）
 - **mathjs** 负责表达式解析、单位量纲与常用单位换算
-- **IndexedDB** 自动保存，支持 JSON 导出/导入（导出保留可再次编辑的 LaTeX 表达式）
+- **IndexedDB** 自动保存，支持 JSON 导出/导入（导出保留可再次编辑的 LaTeX 表达式、公式版本、引用与快照）
 
 ## 启动
 
 ```bash
 npm install
-npm run dev       # 本地开发
+npm run dev       # 本地开发（端到端脚本默认访问 5199 端口：npm run dev -- --port 5199）
 npm run build     # 类型检查 + 生产构建到 dist/
-npm test          # 36 个单元测试（引擎 + 导出导入）
-node e2e/smoke.mjs # 25 项真实浏览器端到端检查（需先 npm run dev）
+npm test          # 60 个单元测试（引擎 / 引用图 / 导出导入 / 标注渲染）
+node e2e/smoke.mjs # 25 项真实浏览器端到端检查（需先启动 dev 并安装 Playwright Chromium）
+node e2e/refs.mjs  # 已发布结果引用的 4 类验收场景端到端检查
 ```
 
 ## 首版明确支持的范围
@@ -38,26 +40,40 @@ node e2e/smoke.mjs # 25 项真实浏览器端到端检查（需先 npm run dev�
 6. **超出支持范围**：函数（sin、cos、sqrt…）、取模、阶乘、关系符、±、矩阵/对象等，标记“未验证”而不是强行计算。
 7. **公式隔离**：每条公式独立分析、独立持久化，一条公式的任何错误都不会影响其他公式。
 8. **三段展示**：原式 → 替换变量后的计算式 → 结果（含结果单位及可选的目标单位换算值）。导出的 JSON 同时保存 LaTeX（可编辑本体）与中缀表达式（便于备份查看）。
+9. **已发布结果引用（跨公式派生变量）**：
+   - 只有状态为「已验证」且量纲明确的结果才能被引用（无量纲纯数也算量纲明确；错误/未验证/空公式不可发布）。
+   - 引用保存了**来源 id、建立时来源版本（pinnedSourceVersion）与最后一次有效快照**；每条内容编辑（LaTeX/变量/目标单位/引用集合）都会让公式 `version +1`，备注修改不升版。
+   - 系统按依赖图做**拓扑排序、沿链路重新计算**：上游结果变化（含版本变化）时下游自动跟随最新有效结果，不需要手工抄数。
+   - **阻塞 / 过期**：上游出现错误、未验证或被删除（含多级链路传播）时，下游进入可解释的「引用阻塞」状态，问题列表给出具体原因，**绝不拿旧快照冒充当前结果**；同时保留 `lastSnapshot`（数值、单位、来源版本、备注、抓取时间）供历史查看。
+   - **循环防护**：建立引用前做完整环路检测，直接（A→A）或间接（A→B→A）循环都会在保存前被拒绝并展示完整环路，任何一条既有公式都不会被改写（不留半条引用）。
+   - **追溯显示**：原式中的引用符号为绿色下划线 + “引”角标；代入式显示来源数值；卡片显示来源公式、当前来源版本与建立时版本；阻塞时原式/代入式对应符号变红。
+   - 引用别名支持 `L_ref` / `L_{ref}` 两种写法（转换器会把已知别名整体识别为一个符号，不会把 `L_ref` 拆成隐式乘法）。
+10. **引用的持久化与导入导出**：JSON 升级为 `version: 2`（旧 v1 文件仍可导入），导出包含公式标识、版本、引用关系与快照；导入时 id 与已有笔记或文件内重复会重新生成，文件内引用**自动重连到正确副本**，指向文件外且找不到来源的引用**明确标记为未解析**（保留快照、刷新后进入阻塞）；刷新与重复导入后状态均与来源版本保持一致。
 
 ## 项目结构
 
 ```
 src/
   engine/
-    latex.ts        # MathLive LaTeX → mathjs 中缀表达式（含范围控制）
-    math.ts         # 解析/量纲检查/定位/求值/换算，输出结构化 Issue
+    latex.ts        # MathLive LaTeX → mathjs 中缀表达式（含范围控制、引用别名整体识别）
+    math.ts         # 解析/量纲检查/定位/求值/换算，输出结构化 Issue（支持外部引用绑定与追溯标注）
+    graph.ts        # 引用依赖图：发布校验、保存前循环检测、拓扑排序/链路重算、阻塞传播、快照补丁
     units.ts        # 首版常用单位清单（输入提示）
-    types.ts        # Formula / AnalysisResult / Issue 类型
+    types.ts        # Formula / ResultRef / PublishedSnapshot / AnalysisResult / Issue 类型
     math.test.ts    # 引擎测试（摄氏、角度、除零、定位、隔离…）
+    graph.test.ts   # 引用图测试（速度换算、阻塞/快照、循环拒绝、沿链重算…）
+    refs-tex.test.ts# 引用追溯 TeX 的 KaTeX 渲染冒烟
   storage/
-    db.ts           # IndexedDB 封装
-    exchange.ts     # JSON 导出/导入
+    db.ts           # IndexedDB 封装（formula keyPath=id，版本/引用/快照随记录保存）
+    exchange.ts     # JSON 导出/导入（v2：版本、引用、快照；id 冲突重映射、未解析与循环防护）
   components/
     MathInput.tsx   # MathLive math-field 封装
     Tex.tsx         # KaTeX 渲染
     VariableTable.tsx
-    FormulaCard.tsx # 单条公式：输入/赋值/三段展示/问题定位
+    RefsPanel.tsx   # 引用面板：来源选择/别名/连接状态/阻塞原因/快照/插入表达式/断开
+    FormulaCard.tsx # 单条公式：输入/赋值/引用/三段展示/问题定位/阻塞横幅/历史快照
     UnitSuggestions.tsx
   App.tsx  main.tsx  styles.css
-e2e/smoke.mjs       # Playwright 端到端冒烟
+e2e/smoke.mjs       # Playwright 端到端冒烟（原有 25 项）
+e2e/refs.mjs        # 引用验收：km/h 换算、阻塞+快照+隔离、A→B→A 拒绝、刷新/重复导入/未解析
 ```

@@ -155,9 +155,65 @@ interface Parser {
   toks: Tok[];
   pos: number;
   notices: string[];
+  /** 已知的派生变量（引用别名），如 L_ref：遇到时整体消费为一个符号 */
+  aliases: Set<string>;
 }
 
 const peek = (p: Parser): Tok | undefined => p.toks[p.pos];
+
+/** 从当前位置尝试匹配已知别名（按长度降序，避免前缀抢先）；匹配则消费并返回名字 */
+function consumeAlias(p: Parser): string | null {
+  const names = [...p.aliases].sort((a, b) => b.length - a.length);
+  // 把纯文本片段（字母/数字）按词法 token 匹配：字母→逐字符 word，数字串→num
+  const matchText = (text: string, start: number): number | null => {
+    let pos = start;
+    let i = 0;
+    while (i < text.length) {
+      const ch = text[i];
+      if (/[A-Za-z]/.test(ch)) {
+        const t = p.toks[pos];
+        if (!t || t.t !== "word" || t.v !== ch) return null;
+        pos++; i++;
+      } else if (/[0-9]/.test(ch)) {
+        const m = /^[0-9]+/.exec(text.slice(i));
+        const t = p.toks[pos];
+        if (!t || t.t !== "num" || t.v !== m![0]) return null;
+        pos++; i += m![0].length;
+      } else {
+        return null; // 希腊字母等不在别名匹配范围（建立引用时建议拉丁字母名）
+      }
+    }
+    return pos;
+  };
+
+  for (const name of names) {
+    const parts = name.split("_");
+    let pos = p.pos;
+    const afterBase = matchText(parts[0], pos);
+    if (afterBase === null) continue;
+    pos = afterBase;
+    let ok = true;
+    for (let i = 1; i < parts.length; i++) {
+      if (p.toks[pos]?.t !== "under") { ok = false; break; }
+      pos++;
+      // 允许 L_ref 与 L_{ref} 两种写法
+      const braced = p.toks[pos]?.t === "lb";
+      if (braced) pos++;
+      const after = matchText(parts[i], pos);
+      if (after === null) { ok = false; break; }
+      pos = after;
+      if (braced) {
+        if (p.toks[pos]?.t !== "rb") { ok = false; break; }
+        pos++;
+      }
+    }
+    if (ok) {
+      p.pos = pos;
+      return name;
+    }
+  }
+  return null;
+}
 
 function startsAtom(p: Parser): boolean {
   const t = peek(p);
@@ -216,6 +272,22 @@ function parseAtom(p: Parser): string {
   if (t.t === "num") { p.pos++; return t.v; }
 
   if (t.t === "word") {
+    // 优先匹配引用别名（多字母/带下划线的派生变量整体作为符号）
+    if (p.aliases.size) {
+      const alias = consumeAlias(p);
+      if (alias !== null) {
+        // 别名后仍允许下标/上标（一般不会有，保持与普通 word 相同处理）
+        let name = alias;
+        const nxt = peek(p);
+        if (nxt && nxt.t === "under") {
+          p.pos++;
+          if (!startsAtom(p)) throw new LatexConvertError(`下标符号 “_” 后缺少下标内容（变量 ${name}）`);
+          const sub = parseSubscript(p);
+          name = sub === "" ? name : `${name}_${sub}`;
+        }
+        return name;
+      }
+    }
     p.pos++;
     let name = t.v;
     // 下标：x_1、x_{out}、\alpha_0
@@ -334,11 +406,11 @@ function parseExpr(p: Parser): string {
   return left;
 }
 
-export function latexToSource(latex: string): ConvertResult {
+export function latexToSource(latex: string, knownAliases?: Set<string>): ConvertResult {
   const trimmed = latex.trim();
   if (!trimmed) return { source: "", notices: [] };
   const toks = tokenize(trimmed);
-  const p: Parser = { toks, pos: 0, notices: [] };
+  const p: Parser = { toks, pos: 0, notices: [], aliases: knownAliases ?? new Set() };
   const source = parseExpr(p);
   if (p.pos !== toks.length) {
     const extra = toks[p.pos];

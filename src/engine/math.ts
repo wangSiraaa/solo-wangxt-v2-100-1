@@ -7,7 +7,7 @@ import {
   OperatorNode, ParenthesisNode,
 } from "mathjs";
 import { latexToSource, LatexConvertError } from "./latex";
-import type { AnalysisResult, Issue, VariableDef } from "./types";
+import type { AnalysisResult, ExternalBinding, Issue, VariableDef } from "./types";
 
 const math: MathJsInstance = create(all);
 
@@ -58,6 +58,14 @@ type EvalVal = Quantity | typeof SKIPPED;
 // 节点路径标记（同时用于原树与替换树）
 const ORIG_PATH: unique symbol = Symbol("origPath");
 type PathNode = AnyNode & { [ORIG_PATH]?: number[] };
+
+// 引用来源标记：引用别名符号节点（及替换后的字面量节点）用此标记来源状态
+const REF_MARK: unique symbol = Symbol("refMark");
+type RefMarkNode = AnyNode & { [REF_MARK]?: "ok" | "blocked" };
+
+/** 绿色（可用引用）/红色（阻塞引用）的追溯标注颜色 */
+const REF_OK_COLOR = "#1a7f37";
+const REF_BLOCKED_COLOR = "#d11f2d";
 
 function isUnit(v: EvalVal): v is Unit {
   return v !== SKIPPED && math.isUnit(v);
@@ -336,31 +344,43 @@ function splitQuantity(q: Quantity): { value: number; unit: string } {
 
 // ---------- 变量替换后的 AST（结构与原树一一对应，路径同步） ----------
 
-function literalNode(v: Quantity, path: number[]): AnyNode {
+function literalNode(v: Quantity, path: number[], refMark?: "ok" | "blocked"): AnyNode {
   const literal = typeof v === "number"
     ? `(${formatNumber(v)})`
     : `(${v.toString()})`;
   const n = asAny(math.parse(literal));
   (n as PathNode)[ORIG_PATH] = path;
+  if (refMark) (n as RefMarkNode)[REF_MARK] = refMark;
   return n;
 }
 
-function substitute(node: AnyNode, scope: Map<string, Quantity>, path: number[]): AnyNode {
+function substitute(
+  node: AnyNode,
+  scope: Map<string, Quantity>,
+  path: number[],
+  externals?: Map<string, ExternalBinding>,
+): AnyNode {
   let out: AnyNode;
 
   if (node.isParenthesisNode) {
-    out = asAny(new ParenthesisNode(substitute(node.content, scope, path)) as unknown as MathNode);
+    out = asAny(new ParenthesisNode(substitute(node.content, scope, path, externals)) as unknown as MathNode);
   } else if (node.isSymbolNode) {
-    const v = scope.get(node.name) ?? (node.name === "pi" ? Math.PI : node.name === "e" ? Math.E : undefined);
-    out = v !== undefined ? literalNode(v, path) : node;
+    const ext = externals?.get(node.name);
+    const v = ext && ext.status === "ok" && ext.value !== undefined
+      ? (ext.unit ? math.unit(`${ext.value} (${ext.unit})`) : ext.value)
+      : scope.get(node.name) ?? (node.name === "pi" ? Math.PI : node.name === "e" ? Math.E : undefined);
+    const refMark: "ok" | "blocked" | undefined =
+      ext ? (ext.status === "ok" ? "ok" : "blocked") : undefined;
+    out = v !== undefined ? literalNode(v, path, refMark) : node;
+    if (v === undefined && refMark) (out as RefMarkNode)[REF_MARK] = refMark;
   } else if (node.isConstantNode) {
     out = node;
   } else if (node.isOperatorNode) {
-    const kids = node.args.map((c, i) => substitute(c, scope, [...path, i]));
+    const kids = node.args.map((c, i) => substitute(c, scope, [...path, i], externals));
     out = asAny(new OperatorNode(node.op as never, node.fn as never, kids, node.implicit) as unknown as MathNode);
   } else if (node.isFunctionNode) {
     // 超出范围：参数仍替换以便看到代入值，但函数本身不计算
-    const kids = node.args.map((c, i) => substitute(c, scope, [...path, i]));
+    const kids = node.args.map((c, i) => substitute(c, scope, [...path, i], externals));
     out = asAny(new (node.constructor as { new(fn: unknown, args: AnyNode[]): AnyNode })(node.fn, kids) as unknown as MathNode);
   } else {
     out = node;
@@ -389,19 +409,24 @@ function highlightTex(root: AnyNode, issues: Issue[]): string {
   const handler = (node: AnyNode, options: unknown): string | undefined => {
     if (rendering) return undefined;
     const p = (node as PathNode)[ORIG_PATH];
-    if (p !== undefined) {
-      const kind = paths.get(p.join("."));
-      if (kind) {
-        rendering = true;
-        let inner: string;
-        try {
-          inner = node.toTex(options as never);
-        } finally {
-          rendering = false;
-        }
-        return `\\color{${color(kind)}}{${inner}}`;
-      }
+    const kind = p !== undefined ? paths.get(p.join(".")) : undefined;
+    const mark = (node as RefMarkNode)[REF_MARK];
+    if (!kind && !mark) return undefined;
+    rendering = true;
+    let inner: string;
+    try {
+      inner = node.toTex(options as never);
+    } finally {
+      rendering = false;
     }
+    // 问题高亮优先（阻塞引用本身也带错误节点，同为红色）
+    if (kind === "error") return `\\color{${color("error")}}{${inner}}`;
+    if (kind === "warning") return `\\color{${color("warning")}}{${inner}}`;
+    // 可用的已发布结果引用：绿色下划线 + “引”来源标注
+    if (mark === "ok") {
+      return `{\\color{${REF_OK_COLOR}}{\\underline{${inner}}}}^{\\color{${REF_OK_COLOR}}{\\text{引}}}`;
+    }
+    if (mark === "blocked") return `\\color{${REF_BLOCKED_COLOR}}{${inner}}`;
     return undefined;
   };
 
@@ -414,16 +439,19 @@ export function analyzeFormula(
   latex: string,
   varDefs: Record<string, VariableDef>,
   targetUnitText: string,
+  externals: ExternalBinding[] = [],
 ): AnalysisResult {
+  const externalMap = new Map<string, ExternalBinding>();
+  for (const b of externals) externalMap.set(b.alias, b);
   if (!latex.trim()) {
-    return { status: "empty", variables: [], issues: [] };
+    return { status: "empty", variables: [], issues: [], externalAliases: externals.map((b) => b.alias) };
   }
 
-  // 1) LaTeX → 中缀表达式
+  // 1) LaTeX → 中缀表达式（引用别名整体作为符号，避免 L_ref 被拆成 L_r·e·f）
   let source: string;
   const convertNotices: string[] = [];
   try {
-    const conv = latexToSource(latex);
+    const conv = latexToSource(latex, new Set(externalMap.keys()));
     source = conv.source;
     convertNotices.push(...new Set(conv.notices));
   } catch (e) {
@@ -469,13 +497,38 @@ export function analyzeFormula(
     col.issues.push({ kind: "warning", path: [], snippet: tree.toTex(), message: notice });
   }
 
-  const variables = collectVariables(tree);
+  const allVariables = collectVariables(tree);
+  // 引用别名作为派生变量由外部结果提供，不出现在手工变量表中
+  const variables = allVariables.filter((name) => !externalMap.has(name));
 
-  // 4) 变量解析（同一变量多处引用：只在首次出现处报未定义）
+  // 4) 变量解析（同一变量多处引用：只在首次出现处报未定义/阻塞）
   const scope = new Map<string, Quantity>();
   const failedNames = new Set<string>();
   walk(tree, [], (n, p) => {
     if (n.isSymbolNode && !BUILTIN_CONSTANTS.has(n.name) && !scope.has(n.name) && !failedNames.has(n.name)) {
+      const ext = externalMap.get(n.name);
+      if (ext) {
+        // 引用绑定：可用且量纲明确才把数值/单位注入作用域；否则记录阻塞错误
+        if (ext.status === "blocked" || ext.value === undefined) {
+          failedNames.add(n.name);
+          col.add("error", p, n,
+            ext.reason
+              ? `引用变量 ${n.name} 不可用：${ext.reason}。系统不会用历史快照冒充当前结果`
+              : `引用变量 ${n.name} 不可用（上游未验证或不存在），下游已阻塞`);
+          return;
+        }
+        if (!ext.unit) {
+          scope.set(n.name, ext.value);
+          return;
+        }
+        try {
+          scope.set(n.name, math.unit(`${ext.value} (${ext.unit})`));
+        } catch {
+          failedNames.add(n.name);
+          col.add("error", p, n, `引用变量 ${n.name} 的来源单位“${ext.unit}”无法识别，下游已阻塞`);
+        }
+        return;
+      }
       // 兼容 T1 与 T_1 两种变量命名
       const def = varDefs[n.name] ?? varDefs[n.name.replace(/_(\d+)$/, "$1")];
       const v = resolveVariable(n.name, def, n, p, col);
@@ -484,11 +537,18 @@ export function analyzeFormula(
     }
   });
 
+  // 给引用别名符号节点标注来源状态（原式追溯显示）
+  walk(tree, [], (n) => {
+    if (n.isSymbolNode && externalMap.has(n.name)) {
+      (n as RefMarkNode)[REF_MARK] = externalMap.get(n.name)!.status === "ok" ? "ok" : "blocked";
+    }
+  });
+
   // 5) 求值 + 量纲检查
   const raw = evalNode(tree, [], scope, failedNames, col);
 
-  // 6) 替换树（展示计算式 + 高亮），结构与原树一一对应
-  const subTree = substitute(tree, scope, []);
+  // 6) 替换树（展示计算式 + 高亮），结构与原树一一对应；引用变量替换为来源数值
+  const subTree = substitute(tree, scope, [], externalMap);
   const substituted = subTree.toString({ parenthesize: "all", implicit: "show" });
 
   // 7) 结果与目标单位换算
@@ -553,5 +613,6 @@ export function analyzeFormula(
     targetValue,
     targetUnit,
     summary,
+    externalAliases: externals.map((b) => b.alias),
   };
 }
