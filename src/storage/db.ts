@@ -1,5 +1,6 @@
 // IndexedDB 本地持久化。无服务器，所有数据仅保存在浏览器本地。
-import type { Formula } from "../engine/types";
+// 引用（refs）与版本号（revision）随公式一同存储；旧版数据加载时做前向迁移。
+import type { Formula, RefBinding } from "../engine/types";
 
 const DB_NAME = "dimension-notebook";
 const STORE = "formulas";
@@ -31,10 +32,49 @@ function tx<T>(mode: IDBTransactionMode, run: (store: IDBObjectStore) => IDBRequ
   );
 }
 
+/** 规整/迁移一条来自旧版本或外部导入的公式记录，保证引用与版本字段可用 */
+export function normalizeFormula(raw: unknown): Formula | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Partial<Formula>;
+  if (typeof r.id !== "string" || typeof r.latex !== "string") return null;
+
+  const refs: RefBinding[] = Array.isArray(r.refs)
+    ? r.refs.filter((x): x is RefBinding =>
+        !!x && typeof x === "object" &&
+        typeof (x as RefBinding).name === "string" &&
+        typeof (x as RefBinding).sourceId === "string")
+      .map((x) => ({
+        name: x.name,
+        sourceId: x.sourceId,
+        sourceRevision: typeof x.sourceRevision === "number" ? x.sourceRevision : 0,
+        snapshot: x.snapshot && typeof x.snapshot === "object" ? {
+          value: Number(x.snapshot.value),
+          unit: String(x.snapshot.unit ?? ""),
+          sourceRevision: Number(x.snapshot.sourceRevision ?? 0),
+          capturedAt: Number(x.snapshot.capturedAt ?? 0),
+        } : undefined,
+      }))
+    : [];
+
+  return {
+    id: r.id,
+    latex: r.latex,
+    note: typeof r.note === "string" ? r.note : "",
+    variables: r.variables && typeof r.variables === "object" ? r.variables : {},
+    targetUnit: typeof r.targetUnit === "string" ? r.targetUnit : "",
+    createdAt: typeof r.createdAt === "number" ? r.createdAt : Date.now(),
+    revision: typeof r.revision === "number" && r.revision > 0 ? r.revision : 1,
+    refs,
+  };
+}
+
 export const db = {
   async all(): Promise<Formula[]> {
     const rows = await tx<Formula[]>("readonly", (s) => s.getAll() as IDBRequest<Formula[]>);
-    return rows.sort((a, b) => a.createdAt - b.createdAt);
+    return rows
+      .map(normalizeFormula)
+      .filter((f): f is Formula => f !== null)
+      .sort((a, b) => a.createdAt - b.createdAt);
   },
   async put(formula: Formula): Promise<void> {
     await tx<IDBValidKey>("readwrite", (s) => s.put(formula));

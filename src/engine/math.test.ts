@@ -255,3 +255,58 @@ describe("格式化", () => {
     expect(formatNumber(2)).toBe("2");
   });
 });
+
+describe("已发布结果引用（派生变量 / 阻塞）", () => {
+  it("派生变量以数值+单位注入，结果与手填一致", () => {
+    const r = analyzeFormula("L/T", {}, "", {
+      derived: { L: { value: "100", unit: "m" }, T: { value: "4", unit: "s" } },
+      liveDerived: new Set(["L", "T"]),
+    });
+    expect(r.status).toBe("ok");
+    expect(r.value).toBeCloseTo(25, 10);
+    expect(r.resultUnit).toBe("m / s");
+    // 原式中派生变量染蓝色
+    expect(r.originalTex).toContain("#1f6feb");
+    // 代入式显示来源值（可追溯，不是符号）
+    expect(r.substituted).toContain("m");
+  });
+
+  it("派生变量优先于同名手填变量（引用值不被手工抄数覆盖）", () => {
+    const r = analyzeFormula("x", { x: { value: "1", unit: "kg" } }, "", {
+      derived: { x: { value: "9", unit: "m" } },
+      liveDerived: new Set(["x"]),
+    });
+    expect(r.status).toBe("ok");
+    expect(r.value).toBe(9);
+    expect(r.resultUnit).toBe("m");
+  });
+
+  it("被阻塞的派生变量：status=blocked、无值无代入式、问题可解释且原式高亮定位", () => {
+    const r = analyzeFormula("x*2", {}, "", {
+      blockedMessages: { x: "派生变量 x 的来源存在错误。最后一次有效值（仅供历史查看，未参与本次计算）：3 m / s，来源版本 v1" },
+    });
+    expect(r.status).toBe("blocked");
+    expect(r.value).toBeUndefined();
+    expect(r.targetValue).toBeUndefined();
+    expect(r.substituted).toBeUndefined();
+    expect(r.substitutedTex).toBeUndefined();
+    expect(r.blockedRefs).toEqual(["x"]);
+    expect(r.issues).toHaveLength(1);
+    expect(r.issues[0].kind).toBe("error");
+    expect(r.issues[0].path).toEqual([0, 0]);
+    expect(r.issues[0].message).toContain("来源存在错误");
+    expect(r.issues[0].message).toContain("3 m / s");
+    // 原式在该派生变量处高亮定位（阻塞错误按红色显示；live 引用才是蓝色溯源）
+    expect(r.originalTex).toContain("#d11f2d");
+    expect(r.originalTex).toContain("x");
+  });
+
+  it("阻塞与普通量纲错误并存时仍为 blocked，且不产出结果", () => {
+    const r = analyzeFormula("x + a", { a: { value: "1", unit: "kg" } }, "", {
+      derived: { x: { value: "1", unit: "m" } },
+      blockedMessages: { x: "上游被删除" },
+    });
+    expect(r.status).toBe("blocked");
+    expect(r.value).toBeUndefined();
+  });
+});

@@ -1,15 +1,22 @@
-// 单条公式卡片：输入、变量赋值、原式/替换式/结果三段展示、问题定位
-import { useMemo, useState } from "react";
-import type { Formula, VariableDef } from "../engine/types";
-import { analyzeFormula } from "../engine/math";
+// 单条公式卡片：输入、变量赋值、引用、原式/替换式/结果三段展示、问题定位与来源追溯
+import { useState } from "react";
+import type { Formula, RefBinding } from "../engine/types";
+import type { NotebookEntry } from "../engine/graph";
 import MathInput from "./MathInput";
 import Tex from "./Tex";
 import VariableTable from "./VariableTable";
+import RefEditor from "./RefEditor";
+import RefTracePanel from "./RefTracePanel";
 
 interface Props {
   formula: Formula;
+  entry: NotebookEntry;
   index: number;
+  /** 可作为引用来源的“已验证”公式（排除自己） */
+  sources: { id: string; label: string; resultText: string }[];
+  validateRefs: (next: RefBinding[]) => string[];
   onChange: (patch: Partial<Formula>) => void;
+  onRefsChange: (refs: RefBinding[]) => void;
   onDelete: () => void;
 }
 
@@ -17,18 +24,18 @@ const STATUS_META = {
   ok: { label: "已验证", cls: "ok" },
   unverified: { label: "未验证", cls: "warn" },
   error: { label: "有错误", cls: "err" },
+  blocked: { label: "引用阻塞", cls: "blocked" },
   empty: { label: "空公式", cls: "empty" },
 } as const;
 
-export default function FormulaCard({ formula, index, onChange, onDelete }: Props) {
+export default function FormulaCard({
+  formula, entry, index, sources, validateRefs, onChange, onRefsChange, onDelete,
+}: Props) {
   const [collapsed, setCollapsed] = useState(false);
-  const result = useMemo(
-    () => analyzeFormula(formula.latex, formula.variables, formula.targetUnit),
-    [formula.latex, formula.variables, formula.targetUnit],
-  );
+  const result = entry.result;
   const meta = STATUS_META[result.status];
 
-  const setVars = (variables: Record<string, VariableDef>) => onChange({ variables });
+  const setVars = (variables: Formula["variables"]) => onChange({ variables });
 
   return (
     <section className={`card status-${meta.cls}`}>
@@ -37,7 +44,9 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
           {collapsed ? "▸" : "▾"}
         </button>
         <strong>公式 {index + 1}</strong>
+        {formula.note && <span className="note-tag" title={formula.note}>{formula.note}</span>}
         <span className={`badge ${meta.cls}`}>{meta.label}</span>
+        <span className="rev-tag" title="内容版本号（引用方据此对齐来源版本）">v{formula.revision}</span>
         <span className="summary">{result.summary}</span>
         <button type="button" className="mini-btn danger" onClick={onDelete} title="删除此公式（不影响其他公式）">
           删除
@@ -55,10 +64,22 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
             />
           </label>
 
+          <RefEditor
+            formula={formula}
+            sources={sources.filter((s) => s.id !== formula.id)}
+            validate={validateRefs}
+            onChange={onRefsChange}
+          />
+
           <div className="grid-2">
             <div>
               <div className="field-label">变量赋值</div>
-              <VariableTable names={result.variables} value={formula.variables} onChange={setVars} />
+              <VariableTable
+                names={result.variables}
+                value={formula.variables}
+                onChange={setVars}
+                traces={entry.traces}
+              />
             </div>
             <div>
               <label className="field-label">
@@ -82,6 +103,8 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
             </div>
           </div>
 
+          <RefTracePanel traces={entry.traces} />
+
           {result.source !== undefined && (
             <div className="display-area">
               <div className="display-row">
@@ -94,10 +117,14 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
                   {result.substitutedTex ? (
                     <>
                       <Tex tex={result.substitutedTex} />
-                      {result.status !== "ok" && (
+                      {result.status !== "ok" && result.status !== "blocked" && (
                         <span className="muted small">（未赋值或出错处保留符号）</span>
                       )}
                     </>
+                  ) : result.status === "blocked" ? (
+                    <span className="blocked-text">
+                      引用阻塞：代入式不使用任何历史值，待上游恢复为“已验证”后自动沿链路重算
+                    </span>
                   ) : (
                     <span className="muted">—</span>
                   )}
@@ -106,7 +133,7 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
               <div className="display-row result-row">
                 <span className="row-tag">结果</span>
                 <div className="tex-box">
-                  {result.status === "ok" || result.status === "unverified" ? (
+                  {result.status === "ok" ? (
                     <div>
                       {result.value !== undefined && (
                         <div className="result-line">
@@ -119,10 +146,18 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
                           <span className="muted small">（按目标单位换算）</span>
                         </div>
                       )}
-                      {result.status === "unverified" && <div className="warn-text">{result.summary}</div>}
+                    </div>
+                  ) : result.status === "unverified" ? (
+                    <div>
+                      {result.value !== undefined && (
+                        <div className="result-line">
+                          <Tex tex={`= ${fmt(result.value)}${result.resultUnit ? `~${toTexUnit(result.resultUnit)}` : ""}`} />
+                        </div>
+                      )}
+                      <div className="warn-text">{result.summary}</div>
                     </div>
                   ) : (
-                    <span className="err-text">{result.summary}</span>
+                    <span className={result.status === "blocked" ? "blocked-text" : "err-text"}>{result.summary}</span>
                   )}
                 </div>
               </div>
@@ -134,7 +169,7 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
               {result.issues.map((iss, i) => (
                 <li key={i} className={`issue ${iss.kind}`}>
                   <span className={`dot ${iss.kind}`} />
-                  <span className="issue-kind">{iss.kind === "error" ? "错误" : "未验证"}</span>
+                  <span className="issue-kind">{iss.kind === "error" ? (result.status === "blocked" ? "引用阻塞" : "错误") : "未验证"}</span>
                   <span className="issue-msg">{iss.message}</span>
                   <span className="issue-snippet">
                     定位：<Tex tex={iss.snippet || "·"} block={false} />

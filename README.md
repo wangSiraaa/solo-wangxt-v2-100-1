@@ -7,7 +7,8 @@
 - **MathLive** 提供所见即所得的数学输入（`+ − × ÷`、幂、分数、括号、希腊字母/下标）
 - **KaTeX** 渲染原式与代入后的计算式（问题节点红/橙色高亮）
 - **mathjs** 负责表达式解析、单位量纲与常用单位换算
-- **IndexedDB** 自动保存，支持 JSON 导出/导入（导出保留可再次编辑的 LaTeX 表达式）
+- **IndexedDB** 自动保存，支持 JSON 导出/导入（导出保留可再次编辑的 LaTeX 表达式、公式版本、引用与历史快照）
+- **已发布结果引用**：一条已验证公式的数值、单位与来源版本可作为另一条公式的派生变量，依赖图沿链重算
 
 ## 启动
 
@@ -15,8 +16,8 @@
 npm install
 npm run dev       # 本地开发
 npm run build     # 类型检查 + 生产构建到 dist/
-npm test          # 36 个单元测试（引擎 + 导出导入）
-node e2e/smoke.mjs # 25 项真实浏览器端到端检查（需先 npm run dev）
+npm test          # 56 个单元测试（引擎 + 引用依赖图 + 导出导入）
+node e2e/smoke.mjs # 真实浏览器端到端检查（含引用四个验收场景，需先 npm run dev）
 ```
 
 ## 首版明确支持的范围
@@ -38,6 +39,13 @@ node e2e/smoke.mjs # 25 项真实浏览器端到端检查（需先 npm run dev�
 6. **超出支持范围**：函数（sin、cos、sqrt…）、取模、阶乘、关系符、±、矩阵/对象等，标记“未验证”而不是强行计算。
 7. **公式隔离**：每条公式独立分析、独立持久化，一条公式的任何错误都不会影响其他公式。
 8. **三段展示**：原式 → 替换变量后的计算式 → 结果（含结果单位及可选的目标单位换算值）。导出的 JSON 同时保存 LaTeX（可编辑本体）与中缀表达式（便于备份查看）。
+9. **已发布结果引用（派生变量）**：一条公式可把另一条“已验证且量纲明确”的公式结果绑定为派生变量（如把速度公式的 `v` 引入换算公式并指定目标单位 `km/h`）。
+   - **依赖图与沿链重算**：系统维护下游→上游依赖图，按拓扑顺序重新计算；来源改版后所有下游（含多级）自动重算并对齐“来源版本（vN）”。
+   - **只引用已验证结果**：上游出现错误、未验证、被删除或导入后未解析时，下游进入紫色“引用阻塞”状态——**绝不拿旧值冒充当前结果**，不显示代入数值；问题列表给出可解释原因，并保留“最后一次有效快照”（值、单位、来源版本、时间）供历史查看。
+   - **循环保存前拒绝**：直接/间接循环（含 A→B→A 与自引用）在保存前检测并报出完整环路，校验基于暂存数据，**不通过则任何公式都不被改写，不留下半条引用**。
+   - **可追溯展示**：原式中 live 派生变量染蓝、阻塞染紫；变量表只读展示来源值；“引用来源”面板与问题列表显示来源公式、版本与状态。
+   - **持久化与导入导出**：公式标识（id）、内容版本（revision）、引用（refs）与快照随 IndexedDB/JSON v2 保存，旧版数据自动迁移。导入到含同名公式的笔记本时：同批引用重连到导入副本、指向既有公式的引用重连到该副本、仍缺失的引用明确标记“未解析”；重复导入幂等（生成独立副本，不覆盖）。刷新或重新导入后状态与来源版本保持一致。
+   - 普通公式（无引用）走原有独立分析路径，行为与性能不受影响。
 
 ## 项目结构
 
@@ -45,19 +53,24 @@ node e2e/smoke.mjs # 25 项真实浏览器端到端检查（需先 npm run dev�
 src/
   engine/
     latex.ts        # MathLive LaTeX → mathjs 中缀表达式（含范围控制）
-    math.ts         # 解析/量纲检查/定位/求值/换算，输出结构化 Issue
+    math.ts         # 解析/量纲检查/定位/求值/换算，输出结构化 Issue（支持派生变量与阻塞染色）
+    graph.ts        # 已发布结果引用：依赖图、循环检测、拓扑重算、版本对齐、快照
     units.ts        # 首版常用单位清单（输入提示）
-    types.ts        # Formula / AnalysisResult / Issue 类型
+    types.ts        # Formula / RefBinding / AnalysisResult / Issue 类型
     math.test.ts    # 引擎测试（摄氏、角度、除零、定位、隔离…）
+    graph.test.ts   # 引用依赖图验收测试（速度链、阻塞、快照、A→B→A 循环…）
   storage/
-    db.ts           # IndexedDB 封装
-    exchange.ts     # JSON 导出/导入
+    db.ts           # IndexedDB 封装 + 旧版本数据迁移（revision/refs）
+    exchange.ts     # JSON v2 导出/导入（引用重连、未解析标记、幂等）
+    exchange.test.ts
   components/
     MathInput.tsx   # MathLive math-field 封装
     Tex.tsx         # KaTeX 渲染
     VariableTable.tsx
-    FormulaCard.tsx # 单条公式：输入/赋值/三段展示/问题定位
+    FormulaCard.tsx # 单条公式：输入/赋值/引用/三段展示/问题定位/溯源
+    RefEditor.tsx   # 绑定已发布结果（保存前校验名称/来源/循环）
+    RefTracePanel.tsx # 来源版本、状态与历史快照面板
     UnitSuggestions.tsx
   App.tsx  main.tsx  styles.css
-e2e/smoke.mjs       # Playwright 端到端冒烟
+e2e/smoke.mjs       # Playwright 端到端冒烟（含引用四个验收场景）
 ```
